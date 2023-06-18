@@ -1,3 +1,6 @@
+"""
+Modify from https://github.com/JustAnotherArchivist/snscrape
+"""
 __all__ = [
     "Tweet",
     "Medium",
@@ -38,14 +41,15 @@ import random
 import logging
 import os
 import re
-import requests.adapters
-import snscrape.base
 import string
 import time
 import typing
 import urllib.parse
 import urllib3.util.ssl_
 import warnings
+import twitter_crawler.crawler_client.snscrape.base
+from twitter_crawler.aws_utils.secrets_manager import get_proxy_url
+from twitter_crawler.constants.basic import SNSCRAPE_GET_TWEET_BY_USER_ID_BATCH_SIZE
 
 
 _logger = logging.getLogger(__name__)
@@ -56,27 +60,31 @@ _CIPHERS_CHROME = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_PO
 
 
 @dataclasses.dataclass
-class Tweet(snscrape.base.Item):
+class Tweet(twitter_crawler.crawler_client.snscrape.base.Item):
     url: str
     date: datetime.datetime
     rawContent: str
     renderedContent: str
-    id: int
+    id: str
     user: "User"
     replyCount: int
     retweetCount: int
     likeCount: int
     quoteCount: int
-    conversationId: int
+    conversationId: str
     lang: str
     source: typing.Optional[str] = None
+    editHistoryTweetIds: typing.Optional[typing.List[str]] = None
     sourceUrl: typing.Optional[str] = None
     sourceLabel: typing.Optional[str] = None
     links: typing.Optional[typing.List["TextLink"]] = None
-    media: typing.Optional[typing.List["Medium"]] = None
+    mediaDetail: typing.Optional[typing.List[dict[str, typing.Any]]] = None
+    entities: typing.Optional[dict[str, typing.Any]] = None
+    repliedToTweet: typing.Optional["Tweet"] = None
     retweetedTweet: typing.Optional["Tweet"] = None
     quotedTweet: typing.Optional["Tweet"] = None
-    inReplyToTweetId: typing.Optional[int] = None
+    quotedTweetRef: typing.Optional["TweetRef"] = None
+    inReplyToTweetId: typing.Optional[str] = None
     inReplyToUser: typing.Optional["User"] = None
     mentionedUsers: typing.Optional[typing.List["User"]] = None
     coordinates: typing.Optional["Coordinates"] = None
@@ -86,31 +94,32 @@ class Tweet(snscrape.base.Item):
     card: typing.Optional["Card"] = None
     viewCount: typing.Optional[int] = None
     vibe: typing.Optional["Vibe"] = None
+    possiblySensitive: typing.Optional[bool] = None
 
-    username = snscrape.base._DeprecatedProperty(
+    username = twitter_crawler.crawler_client.snscrape.base._DeprecatedProperty(
         "username", lambda self: self.user.username, "user.username"
     )
-    outlinks = snscrape.base._DeprecatedProperty(
+    outlinks = twitter_crawler.crawler_client.snscrape.base._DeprecatedProperty(
         "outlinks",
         lambda self: [x.url for x in self.links] if self.links else [],
         "links (url attribute)",
     )
-    outlinksss = snscrape.base._DeprecatedProperty(
+    outlinksss = twitter_crawler.crawler_client.snscrape.base._DeprecatedProperty(
         "outlinksss",
         lambda self: " ".join(x.url for x in self.links) if self.links else "",
         "links (url attribute)",
     )
-    tcooutlinks = snscrape.base._DeprecatedProperty(
+    tcooutlinks = twitter_crawler.crawler_client.snscrape.base._DeprecatedProperty(
         "tcooutlinks",
         lambda self: [x.tcourl for x in self.links] if self.links else [],
         "links (tcourl attribute)",
     )
-    tcooutlinksss = snscrape.base._DeprecatedProperty(
+    tcooutlinksss = twitter_crawler.crawler_client.snscrape.base._DeprecatedProperty(
         "tcooutlinksss",
         lambda self: " ".join(x.tcourl for x in self.links) if self.links else "",
         "links (tcourl attribute)",
     )
-    content = snscrape.base._DeprecatedProperty(
+    content = twitter_crawler.crawler_client.snscrape.base._DeprecatedProperty(
         "content", lambda self: self.rawContent, "rawContent"
     )
 
@@ -269,7 +278,7 @@ class EventCard(Card):
 
 @dataclasses.dataclass
 class Event:
-    id: int
+    id: str
     category: str
     photo: Photo
     title: typing.Optional[str] = None
@@ -285,7 +294,7 @@ class NewsletterCard(Card):
     title: str
     description: str
     url: str
-    revueAccountId: int
+    revueAccountId: str
     issueCount: int
     imageUrl: typing.Optional[str] = None
 
@@ -297,7 +306,7 @@ class NewsletterIssueCard(Card):
     issueTitle: str
     issueNumber: int
     url: str
-    revueAccountId: int
+    revueAccountId: str
     issueDescription: typing.Optional[str] = None
     imageUrl: typing.Optional[str] = None
 
@@ -313,7 +322,7 @@ class AppPlayerCard(Card):
     title: str
     video: Video
     appCategory: str
-    playerOwnerId: int
+    playerOwnerId: str
     siteUser: typing.Optional["User"] = None
 
 
@@ -475,20 +484,20 @@ class Vibe:
 
 
 @dataclasses.dataclass
-class TweetRef(snscrape.base.Item):
+class TweetRef(twitter_crawler.crawler_client.snscrape.base.Item):
     """A reference to a tweet for which no proper Tweet object could be produced from the data returned by Twitter"""
 
-    id: int
+    id: str
 
     def __str__(self):
         return f"https://twitter.com/i/web/status/{self.id}"
 
 
 @dataclasses.dataclass
-class Tombstone(snscrape.base.Item):
+class Tombstone(twitter_crawler.crawler_client.snscrape.base.Item):
     """A placeholder for a tweet that cannot be accessed"""
 
-    id: int
+    id: str
     text: typing.Optional[str] = None
     textLinks: typing.Optional[typing.List[TextLink]] = None
 
@@ -497,11 +506,11 @@ class Tombstone(snscrape.base.Item):
 
 
 @dataclasses.dataclass
-class User(snscrape.base.Item):
+class User(twitter_crawler.crawler_client.snscrape.base.Item):
     # Most fields can be None if they're not known.
 
     username: str
-    id: int
+    id: str
     displayname: typing.Optional[str] = None
     rawDescription: typing.Optional[
         str
@@ -524,19 +533,20 @@ class User(snscrape.base.Item):
     profileImageUrl: typing.Optional[str] = None
     profileBannerUrl: typing.Optional[str] = None
     label: typing.Optional["UserLabel"] = None
+    entities: typing.Optional[typing.Dict[str, typing.Any]] = None
 
-    descriptionUrls = snscrape.base._DeprecatedProperty(
+    descriptionUrls = twitter_crawler.crawler_client.snscrape.base._DeprecatedProperty(
         "descriptionUrls", lambda self: self.descriptionLinks, "descriptionLinks"
     )
-    linkUrl = snscrape.base._DeprecatedProperty(
+    linkUrl = twitter_crawler.crawler_client.snscrape.base._DeprecatedProperty(
         "linkUrl", lambda self: self.link.url if self.link else None, "link.url"
     )
-    linkTcourl = snscrape.base._DeprecatedProperty(
+    linkTcourl = twitter_crawler.crawler_client.snscrape.base._DeprecatedProperty(
         "linkTcourl",
         lambda self: self.link.tcourl if self.link else None,
         "link.tcourl",
     )
-    description = snscrape.base._DeprecatedProperty(
+    description = twitter_crawler.crawler_client.snscrape.base._DeprecatedProperty(
         "description", lambda self: self.renderedDescription, "renderedDescription"
     )
 
@@ -558,7 +568,7 @@ class UserLabel:
 
 @dataclasses.dataclass
 class UserRef:
-    id: int
+    id: str
     text: typing.Optional[str] = None
     textLinks: typing.Optional[typing.List[TextLink]] = None
 
@@ -567,8 +577,8 @@ class UserRef:
 
 
 @dataclasses.dataclass
-class Community(snscrape.base.Item):
-    id: int
+class Community(twitter_crawler.crawler_client.snscrape.base.Item):
+    id: str
     name: str
     created: datetime.datetime
     admin: typing.Union[User, UserRef]
@@ -583,7 +593,7 @@ class Community(snscrape.base.Item):
 
 
 @dataclasses.dataclass
-class Trend(snscrape.base.Item):
+class Trend(twitter_crawler.crawler_client.snscrape.base.Item):
     name: str
     domainContext: str
     metaDescription: typing.Optional[str] = None
@@ -692,7 +702,7 @@ class _CLIGuestTokenManager(GuestTokenManager):
                 pass
 
 
-class _TwitterTLSAdapter(snscrape.base._HTTPSAdapter):
+class _TwitterTLSAdapter(twitter_crawler.crawler_client.snscrape.base._HTTPSAdapter):
     def init_poolmanager(self, *args, **kwargs):
         # FIXME: When urllib3 2.0.0 is out and can be required, this should use urllib3.util.create_urllib3_context instead of the private, undocumented ssl_ module.
         kwargs["ssl_context"] = urllib3.util.ssl_.create_urllib3_context(
@@ -706,7 +716,7 @@ class _TwitterAPIType(enum.Enum):
     GRAPHQL = 1
 
 
-class _TwitterAPIScraper(snscrape.base.Scraper):
+class _TwitterAPIScraper(twitter_crawler.crawler_client.snscrape.base.Scraper):
     def __init__(self, baseUrl, *, guestTokenManager=None, maxEmptyPages=0, **kwargs):
         super().__init__(**kwargs)
         self._baseUrl = baseUrl
@@ -727,6 +737,8 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
         self._session.mount("https://twitter.com", adapter)
         self._session.mount("https://api.twitter.com", adapter)
         self._set_random_user_agent()
+        proxy_url = get_proxy_url()
+        self._proxies = {"http": proxy_url, "https": proxy_url}
 
     def _set_random_user_agent(self):
         self._userAgent = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.5563.{random.randint(0, 9999)} Safari/537.{random.randint(0, 99)}"
@@ -770,7 +782,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                 )
                 o = r.json()
                 if not o.get("guest_token"):
-                    raise snscrape.base.ScraperException(
+                    raise twitter_crawler.crawler_client.snscrape.base.ScraperException(
                         "Unable to retrieve guest token"
                     )
                 self._guestTokenManager.token = o["guest_token"]
@@ -821,7 +833,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
         try:
             obj = r.json()
         except json.JSONDecodeError as e:
-            raise snscrape.base.ScraperException(
+            raise twitter_crawler.crawler_client.snscrape.base.ScraperException(
                 "Received invalid JSON from Twitter"
             ) from e
         return obj
@@ -1021,11 +1033,13 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                 entry["item"]["content"]["tweet"]["id"]
             ]
         else:
-            raise snscrape.base.ScraperException(f"Unable to handle entry {entryId!r}")
+            raise twitter_crawler.crawler_client.snscrape.base.ScraperException(
+                f"Unable to handle entry {entryId!r}"
+            )
         yield self._tweet_to_tweet(tweet, obj)
 
     def _get_tweet_id(self, tweet):
-        return tweet["id"] if "id" in tweet else int(tweet["id_str"])
+        return tweet["id"] if "id" in tweet else tweet["id_str"]
 
     def _make_tweet(
         self, tweet, user, retweetedTweet=None, quotedTweet=None, card=None, **kwargs
@@ -1048,6 +1062,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                 )
                 for u in tweet["entities"]["urls"]
             ]
+        kwargs["entities"] = tweet["entities"]
         kwargs["url"] = f"https://twitter.com/{user.username}/status/{tweetId}"
         kwargs["replyCount"] = tweet["reply_count"]
         kwargs["retweetCount"] = tweet["retweet_count"]
@@ -1056,9 +1071,11 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
         kwargs["conversationId"] = (
             tweet["conversation_id"]
             if "conversation_id" in tweet
-            else int(tweet["conversation_id_str"])
+            else tweet["conversation_id_str"]
         )
         kwargs["lang"] = tweet["lang"]
+        if "edit_control" in tweet:
+            kwargs["editHistoryTweetIds"] = tweet["edit_control"].get("edit_tweet_ids")
         if "source" in tweet:
             kwargs["source"] = tweet["source"]
             if match := re.search(r'href=[\'"]?([^\'" >]+)', tweet["source"]):
@@ -1066,19 +1083,26 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
             if match := re.search(r">([^<]*)<", tweet["source"]):
                 kwargs["sourceLabel"] = match.group(1)
         if "extended_entities" in tweet and "media" in tweet["extended_entities"]:
-            media = []
-            for medium in tweet["extended_entities"]["media"]:
-                if mediumO := self._make_medium(medium, tweetId):
-                    media.append(mediumO)
-            if media:
-                kwargs["media"] = media
+            kwargs["mediaDetail"] = []
+            for media in tweet["extended_entities"]["media"]:
+                kwargs["mediaDetail"].append(self._make_media_detail(media))
+
+        kwargs["possiblySensitive"] = tweet.get("possibly_sensitive")
         if retweetedTweet:
             kwargs["retweetedTweet"] = retweetedTweet
-        if quotedTweet:
+            if kwargs["possiblySensitive"] is None:
+                kwargs["possiblySensitive"] = retweetedTweet.possiblySensitive
+        if quotedTweet and isinstance(quotedTweet, Tweet):
             kwargs["quotedTweet"] = quotedTweet
+            if kwargs["possiblySensitive"] is None:
+                kwargs["possiblySensitive"] = quotedTweet.possiblySensitive
+        if quotedTweet and isinstance(quotedTweet, TweetRef):
+            kwargs["quotedTweetRef"] = quotedTweet
+        if kwargs["possiblySensitive"] is None:
+            kwargs["possiblySensitive"] = False
         if inReplyToTweetId := tweet.get("in_reply_to_status_id_str"):
-            kwargs["inReplyToTweetId"] = int(inReplyToTweetId)
-            inReplyToUserId = int(tweet["in_reply_to_user_id_str"])
+            kwargs["inReplyToTweetId"] = inReplyToTweetId
+            inReplyToUserId = tweet["in_reply_to_user_id_str"]
             if inReplyToUserId == kwargs["user"].id:
                 kwargs["inReplyToUser"] = kwargs["user"]
             elif tweet["entities"].get("user_mentions"):
@@ -1086,7 +1110,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                     if u["id_str"] == tweet["in_reply_to_user_id_str"]:
                         kwargs["inReplyToUser"] = User(
                             username=u["screen_name"],
-                            id=u["id"] if "id" in u else int(u["id_str"]),
+                            id=u["id"] if "id" in u else u["id_str"],
                             displayname=u["name"],
                         )
             if "inReplyToUser" not in kwargs:
@@ -1097,7 +1121,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
             kwargs["mentionedUsers"] = [
                 User(
                     username=u["screen_name"],
-                    id=u["id"] if "id" in u else int(u["id_str"]),
+                    id=u["id"] if "id" in u else u["id_str"],
                     displayname=u["name"],
                 )
                 for u in tweet["entities"]["user_mentions"]
@@ -1219,6 +1243,52 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                 f'Unsupported medium type on tweet {tweetId}: {medium["type"]!r}'
             )
 
+    def _make_media_detail(self, media):
+        media_detail = {}
+        if "indices" in media:
+            media_detail["start"] = media["indices"][0]
+            media_detail["end"] = media["indices"][1]
+        if "url" in media:
+            media_detail["url"] = media["url"]
+        if "display_url" in media:
+            media_detail["display_url"] = media["display_url"]
+        if "expanded_url" in media:
+            media_detail["expanded_url"] = media["expanded_url"]
+
+        media_key_detail = {}
+        if "media_key" in media:
+            media_detail["media_key"] = media["media_key"]
+            media_key_detail["media_key"] = media["media_key"]
+        if "type" in media:
+            media_key_detail["type"] = media["type"]
+        if "sizes" in media:
+            if "large" in media["sizes"]:
+                media_key_detail["height"] = media["sizes"]["large"]["h"]
+                media_key_detail["width"] = media["sizes"]["large"]["w"]
+            elif "medium" in media["sizes"]:
+                media_key_detail["height"] = media["sizes"]["medium"]["h"]
+                media_key_detail["width"] = media["sizes"]["medium"]["w"]
+            elif "small" in media["sizes"]:
+                media_key_detail["height"] = media["sizes"]["small"]["h"]
+                media_key_detail["width"] = media["sizes"]["small"]["w"]
+            elif "thumb" in media["sizes"]:
+                media_key_detail["height"] = media["sizes"]["thumb"]["h"]
+                media_key_detail["width"] = media["sizes"]["thumb"]["w"]
+        if "media_url_https" in media:
+            media_key_detail["url"] = media["media_url_https"]
+        if (
+            media_key_detail["type"] == "video"
+            or media_key_detail["type"] == "animated_gif"
+        ):
+            if "video_info" in media:
+                media_key_detail["duration_ms"] = media["video_info"].get(
+                    "duration_millis"
+                )
+                media_key_detail["variants"] = media["video_info"].get("variants")
+
+        media_detail["media_key_detail"] = media_key_detail
+        return media_detail
+
     def _make_card(self, card, apiType, tweetId):
         bindingValues = {}
 
@@ -1245,7 +1315,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                 if o["__typename"] == "UserUnavailable":
                     _logger.warning(f"Unavailable user in card on tweet {tweetId}")
                     continue
-                userId = int(o["rest_id"])
+                userId = o["rest_id"]
                 if "legacy" in o:
                     user = self._user_to_user(o["legacy"], id_=userId)
                 else:
@@ -1286,7 +1356,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
             elif value["type"] == "BOOLEAN":
                 bindingValues[key] = value["boolean_value"]
             elif value["type"] == "USER":
-                userId = int(value["user_value"]["id_str"])
+                userId = value["user_value"]["id_str"]
                 bindingValues[key] = userRefs.get(userId)
                 if bindingValues[key] is None:
                     _logger.warning(
@@ -1472,7 +1542,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
             kwargs = _kwargs_from_map(keyKwargMap)
             if "broadcaster_twitter_id" in bindingValues:
                 kwargs["broadcaster"] = User(
-                    id=int(bindingValues["broadcaster_twitter_id"]),
+                    id=bindingValues["broadcaster_twitter_id"],
                     username=bindingValues["broadcaster_username"],
                     displayname=bindingValues["broadcaster_display_name"],
                 )
@@ -1492,7 +1562,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                     "event_subtitle": "description",
                 }
             )
-            kwargs["id"] = int(kwargs["id"])
+            kwargs["id"] = kwargs["id"]
             kwargs["photo"] = Photo(
                 previewUrl=bindingValues["event_thumbnail_small"],
                 fullUrl=bindingValues.get("event_thumbnail_original")
@@ -1510,7 +1580,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                     "issue_count": "issueCount",
                 }
             )
-            kwargs["revueAccountId"] = int(kwargs["revueAccountId"])
+            kwargs["revueAccountId"] = kwargs["revueAccountId"]
             kwargs["issueCount"] = int(kwargs["issueCount"])
             return NewsletterCard(**kwargs)
         elif cardName == "3337203208:newsletter_issue":
@@ -1527,7 +1597,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                 }
             )
             kwargs["issueNumber"] = int(kwargs["issueNumber"])
-            kwargs["revueAccountId"] = int(kwargs["revueAccountId"])
+            kwargs["revueAccountId"] = kwargs["revueAccountId"]
             return NewsletterIssueCard(**kwargs)
         elif cardName == "amplify":
             return AmplifyCard(
@@ -1552,7 +1622,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                     "site": "siteUser",
                 }
             )
-            kwargs["playerOwnerId"] = int(kwargs["playerOwnerId"])
+            kwargs["playerOwnerId"] = kwargs["playerOwnerId"]
             variants = []
             variants.append(
                 VideoVariant(
@@ -1880,7 +1950,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
 
     def _make_tombstone(self, tweetId, info):
         if tweetId is None:
-            raise snscrape.base.ScraperException(
+            raise twitter_crawler.crawler_client.snscrape.base.ScraperException(
                 "Cannot create tombstone without tweet ID"
             )
         if info and (text := info.get("richText", info["text"])):
@@ -1910,21 +1980,24 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
             return self._make_tombstone(tweetId, result.get("tombstone"))
         elif result["__typename"] == "TweetUnavailable":
             if tweetId is None:
-                raise snscrape.base.ScraperException(
+                raise twitter_crawler.crawler_client.snscrape.base.ScraperException(
                     "Cannot handle unavailable tweet without tweet ID"
                 )
             return TweetRef(id=tweetId)
         else:
-            raise snscrape.base.ScraperException(
+            raise twitter_crawler.crawler_client.snscrape.base.ScraperException(
                 f'Unknown result type {result["__typename"]!r}'
             )
         tweet = result["legacy"]
-        userId = int(result["core"]["user_results"]["result"]["rest_id"])
+        userId = result["core"]["user_results"]["result"]["rest_id"]
         user = self._user_to_user(
             result["core"]["user_results"]["result"]["legacy"], id_=userId
         )
         kwargs = {}
-        if "retweeted_status_result" in tweet:
+        if (
+            "retweeted_status_result" in tweet
+            and "result" in tweet["retweeted_status_result"]
+        ):
             # TODO Tombstones will cause a crash here.
             kwargs[
                 "retweetedTweet"
@@ -1936,13 +2009,13 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                 _logger.warning(
                     f'quoted_status_result for {tweet["quoted_status_id_str"]} without an actual result on tweet {self._get_tweet_id(tweet)}, using TweetRef'
                 )
-                kwargs["quotedTweet"] = TweetRef(int(tweet["quoted_status_id_str"]))
+                kwargs["quotedTweet"] = TweetRef(tweet["quoted_status_id_str"])
             else:
                 kwargs[
                     "quotedTweet"
                 ] = self._graphql_timeline_tweet_item_result_to_tweet(
                     result["quoted_status_result"]["result"],
-                    tweetId=int(tweet["quoted_status_id_str"]),
+                    tweetId=tweet["quoted_status_id_str"],
                 )
         elif result.get("quotedRefResult"):
             if result["quotedRefResult"]["result"]["__typename"] == "TweetTombstone":
@@ -1950,7 +2023,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                     "quotedTweet"
                 ] = self._graphql_timeline_tweet_item_result_to_tweet(
                     result["quotedRefResult"]["result"],
-                    tweetId=int(tweet["quoted_status_id_str"]),
+                    tweetId=tweet["quoted_status_id_str"],
                 )
             else:
                 qTweet = result["quotedRefResult"]["result"]
@@ -1966,7 +2039,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                     == "TweetWithVisibilityResults"
                 ):
                     qTweet = qTweet["tweet"]
-                kwargs["quotedTweet"] = TweetRef(id=int(qTweet["rest_id"]))
+                kwargs["quotedTweet"] = TweetRef(id=qTweet["rest_id"])
         elif "quoted_status_id_str" in tweet:
             # Omit the TweetRef if this is a retweet and the quoted tweet ID matches the tweet quoted in the retweeted tweet.
             if tweet["quoted_status_id_str"] != tweet.get(
@@ -1974,7 +2047,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
             ).get("result", {}).get("quoted_status_result", {}).get("result", {}).get(
                 "rest_id"
             ):
-                kwargs["quotedTweet"] = TweetRef(id=int(tweet["quoted_status_id_str"]))
+                kwargs["quotedTweet"] = TweetRef(id=tweet["quoted_status_id_str"])
         if "card" in result:
             kwargs["card"] = self._make_card(
                 result["card"], _TwitterAPIType.GRAPHQL, self._get_tweet_id(tweet)
@@ -1993,7 +2066,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                 continue
             for entry in instruction["entries"]:
                 if entry["entryId"].startswith("tweet-"):
-                    tweetId = int(entry["entryId"].split("-", 1)[1])
+                    tweetId = entry["entryId"].split("-", 1)[1]
                     if (
                         entry["content"]["entryType"] == "TimelineTimelineItem"
                         and entry["content"]["itemContent"]["itemType"]
@@ -2020,10 +2093,10 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                                 not item["entryId"].startswith("homeConversation-")
                                 or "-tweet-" not in item["entryId"]
                             ):
-                                raise snscrape.base.ScraperException(
+                                raise twitter_crawler.crawler_client.snscrape.base.ScraperException(
                                     f'Unexpected home conversation entry ID: {item["entryId"]!r}'
                                 )
-                            tweetId = int(item["entryId"].split("-tweet-", 1)[1])
+                            tweetId = item["entryId"].split("-tweet-", 1)[1]
                             if (
                                 item["item"]["itemContent"]["itemType"]
                                 == "TimelineTweet"
@@ -2044,8 +2117,11 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
                     "conversationthread-"
                 ):  # TODO show more cursor?
                     for item in entry["content"]["items"]:
-                        if item["entryId"].startswith(f'{entry["entryId"]}-tweet-'):
-                            tweetId = int(item["entryId"][len(entry["entryId"]) + 7 :])
+                        if (
+                            item["entryId"].startswith(f'{entry["entryId"]}-tweet-')
+                            and "result" in item["item"]["itemContent"]["tweet_results"]
+                        ):
+                            tweetId = item["entryId"][len(entry["entryId"]) + 7 :]
                             yield self._graphql_timeline_tweet_item_result_to_tweet(
                                 item["item"]["itemContent"]["tweet_results"]["result"],
                                 tweetId=tweetId,
@@ -2082,9 +2158,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
     def _user_to_user(self, user, id_=None):
         kwargs = {}
         kwargs["username"] = user["screen_name"]
-        kwargs["id"] = (
-            id_ if id_ else user["id"] if "id" in user else int(user["id_str"])
-        )
+        kwargs["id"] = id_ if id_ else user["id"] if "id" in user else user["id_str"]
         kwargs["displayname"] = user["name"]
         kwargs["rawDescription"] = user["description"]
         kwargs["renderedDescription"] = self._render_text_with_urls(
@@ -2110,6 +2184,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
         kwargs["mediaCount"] = user["media_count"]
         kwargs["location"] = user["location"]
         kwargs["protected"] = user.get("protected")
+        kwargs["entities"] = user.get("entities")
         if user.get("url"):
             entity = user["entities"].get("url", {}).get("urls", [None])[0]
             if not entity or entity["url"] != user["url"]:
@@ -2155,7 +2230,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
             except ValueError:
                 return None
             assert userId.startswith(b"UserResults:")
-            userId = int(userId.split(b":", 1)[1])
+            userId = userId.split(b":", 1)[1]
         kwargs = {}
         if (
             "result" in obj
@@ -2181,7 +2256,7 @@ class _TwitterAPIScraper(snscrape.base.Scraper):
         ):
             return self._graphql_user_results_to_user_ref(results)
         return self._user_to_user(
-            results["result"]["legacy"], id_=int(results["result"]["rest_id"])
+            results["result"]["legacy"], id_=results["result"]["rest_id"]
         )
 
     @classmethod
@@ -2240,7 +2315,7 @@ class TwitterSearchScraper(_TwitterAPIScraper):
         if cursor is not None:
             warnings.warn(
                 "the `cursor` argument is deprecated",
-                snscrape.base.DeprecatedFeatureWarning,
+                twitter_crawler.crawler_client.snscrape.base.DeprecatedFeatureWarning,
                 stacklevel=2,
             )
         self._cursor = cursor
@@ -2250,7 +2325,7 @@ class TwitterSearchScraper(_TwitterAPIScraper):
             )
             warnings.warn(
                 f"`top` argument is deprecated, use `mode = {replacement}` instead of `top = {bool(top)}`",
-                snscrape.base.DeprecatedFeatureWarning,
+                twitter_crawler.crawler_client.snscrape.base.DeprecatedFeatureWarning,
                 stacklevel=2,
             )
             mode = (
@@ -2354,7 +2429,7 @@ class TwitterSearchScraper(_TwitterAPIScraper):
         )
         subparser.add_argument(
             "query",
-            type=snscrape.base.nonempty_string("query"),
+            type=twitter_crawler.crawler_client.snscrape.base.nonempty_string("query"),
             help="A Twitter search string",
         )
 
@@ -2373,9 +2448,10 @@ class TwitterUserScraper(TwitterSearchScraper):
     name = "twitter-user"
 
     def __init__(self, user, **kwargs):
-        self._isUserId = isinstance(user, int)
-        if not self._isUserId and not self.is_valid_username(user):
-            raise ValueError("Invalid username")
+        # Note: Only Accept user id
+        self._isUserId = True
+        # if not self._isUserId and not self.is_valid_username(user):
+        # 	raise ValueError('Invalid username')
         super().__init__(f"from:{user}", **kwargs)
         self._user = user
         self._baseUrl = (
@@ -2429,9 +2505,13 @@ class TwitterUserScraper(TwitterSearchScraper):
         label = None
         if labelO := user["affiliates_highlighted_label"].get("label"):
             label = self._user_label_to_user_label(labelO)
+
+        if entities := user["legacy"].get("entities"):
+            entities = user["legacy"]["entities"]
+
         return User(
             username=user["legacy"]["screen_name"],
-            id=int(user["rest_id"]),
+            id=user["rest_id"],
             displayname=user["legacy"]["name"],
             rawDescription=rawDescription,
             renderedDescription=renderedDescription,
@@ -2458,13 +2538,14 @@ class TwitterUserScraper(TwitterSearchScraper):
             profileImageUrl=user["legacy"]["profile_image_url_https"],
             profileBannerUrl=user["legacy"].get("profile_banner_url"),
             label=label,
+            entities=entities,
         )
 
     def get_items(self):
         if self._isUserId:
             # Resolve user ID to username
             if self.entity is None:
-                raise snscrape.base.ScraperException(
+                raise twitter_crawler.crawler_client.snscrape.base.ScraperException(
                     f"Could not resolve user ID {self._user!r} to username"
                 )
             self._user = self.entity.username
@@ -2497,9 +2578,7 @@ class TwitterUserScraper(TwitterSearchScraper):
 
     @classmethod
     def _cli_from_args(cls, args):
-        return cls._cli_construct(
-            args, user=int(args.user) if args.isUserId else args.user
-        )
+        return cls._cli_construct(args, user=args.user if args.isUserId else args.user)
 
 
 class TwitterProfileScraper(TwitterUserScraper):
@@ -2508,7 +2587,7 @@ class TwitterProfileScraper(TwitterUserScraper):
     def get_items(self):
         if not self._isUserId:
             if self.entity is None:
-                raise snscrape.base.ScraperException(
+                raise twitter_crawler.crawler_client.snscrape.base.ScraperException(
                     f"Could not resolve username {self._user!r} to ID"
                 )
             userId = self.entity.id
@@ -2516,7 +2595,7 @@ class TwitterProfileScraper(TwitterUserScraper):
             userId = self._user
         paginationVariables = {
             "userId": userId,
-            "count": 100,
+            "count": SNSCRAPE_GET_TWEET_BY_USER_ID_BATCH_SIZE,
             "cursor": None,
             "includePromotedContent": True,
             "withCommunity": True,
@@ -2535,7 +2614,6 @@ class TwitterProfileScraper(TwitterUserScraper):
             "responsive_web_graphql_exclude_directive_enabled": False,
             "verified_phone_label_enabled": False,
             "responsive_web_graphql_timeline_navigation_enabled": True,
-            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
             "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
             "tweetypie_unmention_optimization_enabled": True,
             "vibe_api_enabled": True,
@@ -2573,10 +2651,18 @@ class TwitterProfileScraper(TwitterUserScraper):
                     if instruction["type"] == "TimelinePinEntry":
                         gotPinned = True
                         tweetId = (
-                            int(instruction["entry"]["entryId"][6:])
+                            instruction["entry"]["entryId"][6:]
                             if instruction["entry"]["entryId"].startswith("tweet-")
                             else None
                         )
+                        if (
+                            "result"
+                            not in instruction["entry"]["content"]["itemContent"][
+                                "tweet_results"
+                            ]
+                        ):
+                            continue
+
                         yield self._graphql_timeline_tweet_item_result_to_tweet(
                             instruction["entry"]["content"]["itemContent"][
                                 "tweet_results"
@@ -2597,7 +2683,9 @@ class TwitterHashtagScraper(TwitterSearchScraper):
     def _cli_setup_parser(cls, subparser):
         subparser.add_argument(
             "hashtag",
-            type=snscrape.base.nonempty_string("hashtag"),
+            type=twitter_crawler.crawler_client.snscrape.base.nonempty_string(
+                "hashtag"
+            ),
             help="A Twitter hashtag (without #)",
         )
 
@@ -2617,7 +2705,9 @@ class TwitterCashtagScraper(TwitterSearchScraper):
     def _cli_setup_parser(cls, subparser):
         subparser.add_argument(
             "cashtag",
-            type=snscrape.base.nonempty_string("cashtag"),
+            type=twitter_crawler.crawler_client.snscrape.base.nonempty_string(
+                "cashtag"
+            ),
             help="A Twitter cashtag (without $)",
         )
 
@@ -2653,6 +2743,7 @@ class TwitterTweetScraper(_TwitterAPIScraper):
             "focalTweetId": str(self._tweetId),
             "cursor": None,
             "referrer": "tweet",
+            "count": 2,
             "with_rux_injections": False,
             "includePromotedContent": True,
             "withCommunity": True,
@@ -2707,6 +2798,7 @@ class TwitterTweetScraper(_TwitterAPIScraper):
                         and entry["content"]["entryType"] == "TimelineTimelineItem"
                         and entry["content"]["itemContent"]["itemType"]
                         == "TimelineTweet"
+                        and "result" in entry["content"]["itemContent"]["tweet_results"]
                     ):
                         yield self._graphql_timeline_tweet_item_result_to_tweet(
                             entry["content"]["itemContent"]["tweet_results"]["result"],
@@ -2719,7 +2811,7 @@ class TwitterTweetScraper(_TwitterAPIScraper):
                 _TwitterAPIType.GRAPHQL,
                 params,
                 paginationParams,
-                direction=_ScrollDirection.BOTH,
+                direction=_ScrollDirection.BOTTOM,
             ):
                 if not obj["data"]:
                     continue
@@ -2781,7 +2873,7 @@ class TwitterTweetScraper(_TwitterAPIScraper):
             default=False,
             help="Enable recursion through all tweets encountered (warning: slow, potentially memory-intensive!)",
         )
-        subparser.add_argument("tweetId", type=int, help="A tweet ID")
+        subparser.add_argument("tweetId", type=str, help="A tweet ID")
 
     @classmethod
     def _cli_from_args(cls, args):
@@ -2801,7 +2893,7 @@ class TwitterListPostsScraper(TwitterSearchScraper):
     def _cli_setup_parser(cls, subparser):
         subparser.add_argument(
             "list",
-            type=snscrape.base.nonempty_string("list"),
+            type=twitter_crawler.crawler_client.snscrape.base.nonempty_string("list"),
             help='A Twitter list ID or a string of the form "username/listname" (replace spaces with dashes)',
         )
 
@@ -2855,7 +2947,7 @@ class TwitterCommunityScraper(_TwitterAPIScraper):
         if "description" in community:
             optKwargs["description"] = community["description"]
         return Community(
-            id=int(community["id_str"]),
+            id=community["id_str"],
             name=community["name"],
             created=datetime.datetime.fromtimestamp(
                 community["created_at"] / 1000, tz=datetime.timezone.utc
@@ -2933,7 +3025,7 @@ class TwitterCommunityScraper(_TwitterAPIScraper):
 
     @classmethod
     def _cli_setup_parser(cls, subparser):
-        subparser.add_argument("communityId", type=int, help="A community ID")
+        subparser.add_argument("communityId", type=str, help="A community ID")
 
     @classmethod
     def _cli_from_args(cls, args):
@@ -2996,6 +3088,9 @@ class TwitterTrendsScraper(_TwitterAPIScraper):
                     )
 
 
-__getattr__, __dir__ = snscrape.base._module_deprecation_helper(
+(
+    __getattr__,
+    __dir__,
+) = twitter_crawler.crawler_client.snscrape.base._module_deprecation_helper(
     __all__, DescriptionURL=TextLink
 )
