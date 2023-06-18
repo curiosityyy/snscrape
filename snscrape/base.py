@@ -19,6 +19,13 @@ import requests.adapters
 import urllib3.connection
 import time
 import warnings
+from twitter_crawler.aws_utils.metric import TwitterMetricClient
+from twitter_crawler.constants.basic import (
+    METRIC_DEFAULT_DIMENSION,
+    TWITTER_TWEET_CRAWLER_SERVICE_NAME,
+    SNSCRAPE_GET_REQUEST_COUNT_METRIC_NAME,
+    SNSCRAPE_POST_REQUEST_COUNT_METRIC_NAME,
+)
 
 
 _logger = logging.getLogger(__name__)
@@ -196,6 +203,12 @@ class Scraper:
         self._proxies = proxies
         self._session = requests.Session()
         self._session.mount("https://", _HTTPSAdapter())
+        self._metric_client = TwitterMetricClient(
+            metric_dimension={
+                **METRIC_DEFAULT_DIMENSION,
+                "service": TWITTER_TWEET_CRAWLER_SERVICE_NAME,
+            }
+        )
 
     @abc.abstractmethod
     def get_items(self):
@@ -303,9 +316,11 @@ class Scraper:
         raise RuntimeError("Reached unreachable code")
 
     def _get(self, *args, **kwargs):
+        # self._metric_client.put_count_metric_data(1, SNSCRAPE_GET_REQUEST_COUNT_METRIC_NAME)
         return self._request("GET", *args, **kwargs)
 
     def _post(self, *args, **kwargs):
+        # self._metric_client.put_count_metric_data(1, SNSCRAPE_POST_REQUEST_COUNT_METRIC_NAME)
         return self._request("POST", *args, **kwargs)
 
     @classmethod
